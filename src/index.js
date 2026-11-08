@@ -8474,9 +8474,11 @@ async function checkExpiringDomains() {
 
 // 通用请求助手：发送请求并解析 JSON；HTTP 非 2xx 抛异常，成功与否由各适配器按自家响应判断
 async function renewalApiRequest(url, { method = 'GET', headers = {}, body = null } = {}) {
-  const options = { method, headers };
+  // 部分服务商的 API 会按 User-Agent 拦截非浏览器请求（DNSHE 实测：脚本默认 UA 返回 403），统一带上浏览器 UA
+  const finalHeaders = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36', ...headers };
+  const options = { method, headers: finalHeaders };
   if (body !== null) {
-    options.headers = { ...headers, 'Content-Type': 'application/json' };
+    options.headers = { ...finalHeaders, 'Content-Type': 'application/json' };
     options.body = JSON.stringify(body);
   }
   const response = await fetch(url, options);
@@ -8568,10 +8570,12 @@ const DNSHE_PROVIDER = {
       const items = Array.isArray(data.subdomains) ? data.subdomains : [];
       for (const item of items) {
         if (!item || !item.full_domain) continue;
+        // DNSHE 对正常域名返回的状态是 Registered，归一化为 active；其余状态（如 expired）原样小写传出，由执行器跳过
+        const rawStatus = String(item.status || 'active').toLowerCase();
         all.push({
           providerRef: item.id,
           fullDomain: String(item.full_domain).toLowerCase(),
-          status: item.status || 'active',
+          status: rawStatus === 'registered' ? 'active' : rawStatus,
           expiresAt: item.expires_at ? String(item.expires_at).slice(0, 10) : null,
           neverExpires: item.never_expires === 1 || item.never_expires === true,
         });
