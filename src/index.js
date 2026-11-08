@@ -4380,16 +4380,10 @@ const getHTMLContent = (title) => `
                         <hr style="border-color: rgba(255, 255, 255, 0.1);">
 
                         <h6 class="mb-3" style="display: flex; align-items: center; gap: 5px;"><i class="iconfont icon-arrows-rotate" style="color: white;"></i> 自动续期凭据（API）</h6>
-                        <div class="mb-3">
-                            <label for="dnsheApiKey" class="form-label"><i class="iconfont icon-key"></i> DNSHE API Key</label>
-                            <input type="text" class="form-control" id="dnsheApiKey" placeholder="在 DNSHE 控制台「API 管理」中创建">
-                            <div class="form-text">填写后，DNSHE 的域名会在到期前 175 天内自动续期；两项都留空则不启用</div>
+                        <div id="renewalProvidersSettings">
+                            <div class="form-text">加载中…</div>
                         </div>
-                        <div class="mb-3">
-                            <label for="dnsheApiSecret" class="form-label"><i class="iconfont icon-key"></i> DNSHE API Secret</label>
-                            <input type="text" class="form-control" id="dnsheApiSecret" placeholder="与 API Key 配对的 Secret">
-                            <div class="form-text">凭据保存在 KV 中（renewal_config），备份 KV 时会一并带走</div>
-                        </div>
+                        <div class="form-text mb-3">凭据按服务商保存在 KV 中（renewal_config），备份 KV 时会一并带走；某家凭据全部留空则不启用该家的自动续期</div>
                     </form>
                 </div>
                 <div class="modal-footer">
@@ -5265,17 +5259,47 @@ const getHTMLContent = (title) => `
         
         // 自动续期凭据配置（存 KV 的 renewal_config，按服务商一份）
         let renewalConfigData = {};
+        let renewalProvidersData = [];
 
-        // 加载自动续期凭据配置
+        // 加载自动续期服务商与凭据配置，并按服务商动态渲染凭据输入框（新增适配器后自动出现，不用改设置页）
         async function loadRenewalConfig() {
             try {
-                const response = await fetch('/api/renewal-config');
-                if (!response.ok) throw new Error('获取自动续期凭据配置失败');
+                const [providersResponse, configResponse] = await Promise.all([
+                    fetch('/api/renewal-providers'),
+                    fetch('/api/renewal-config')
+                ]);
+                if (!providersResponse.ok || !configResponse.ok) throw new Error('获取自动续期配置失败');
 
-                renewalConfigData = await response.json();
-                const dnshe = renewalConfigData.dnshe || {};
-                document.getElementById('dnsheApiKey').value = dnshe.apiKey || '';
-                document.getElementById('dnsheApiSecret').value = dnshe.apiSecret || '';
+                renewalProvidersData = await providersResponse.json();
+                renewalConfigData = await configResponse.json();
+
+                const container = document.getElementById('renewalProvidersSettings');
+                if (!Array.isArray(renewalProvidersData) || renewalProvidersData.length === 0) {
+                    container.innerHTML = '<div class="form-text">暂无支持 API 续期的服务商</div>';
+                    return;
+                }
+
+                let html = '';
+                renewalProvidersData.forEach(provider => {
+                    html += '<div class="mb-2 fw-bold">' + escapeHtml(provider.label) + '</div>';
+                    (provider.credentialFields || []).forEach(field => {
+                        const inputId = 'renewal_' + provider.id + '_' + field.name;
+                        html += '<div class="mb-3">' +
+                            '<label for="' + inputId + '" class="form-label"><i class="iconfont icon-key"></i> ' + escapeHtml(field.label || field.name) + '</label>' +
+                            '<input type="text" class="form-control" id="' + inputId + '" placeholder="' + escapeHtml(field.help || '') + '">' +
+                            '</div>';
+                    });
+                });
+                container.innerHTML = html;
+
+                // 回填已保存的值
+                renewalProvidersData.forEach(provider => {
+                    const entry = renewalConfigData[provider.id] || {};
+                    (provider.credentialFields || []).forEach(field => {
+                        const input = document.getElementById('renewal_' + provider.id + '_' + field.name);
+                        if (input) input.value = entry[field.name] || '';
+                    });
+                });
             } catch (error) {
                 // 忽略自动续期凭据配置加载失败
             }
@@ -5319,11 +5343,15 @@ const getHTMLContent = (title) => `
                 
                 telegramConfig = await response.json();
 
-                // 一并保存自动续期凭据（在已加载的整体配置上更新 dnshe 一份后存回，避免冲掉其他服务商的配置）
-                renewalConfigData.dnshe = {
-                    apiKey: document.getElementById('dnsheApiKey').value,
-                    apiSecret: document.getElementById('dnsheApiSecret').value
-                };
+                // 一并保存自动续期凭据（按渲染出的服务商逐个收集，在已加载的整体配置上更新后存回）
+                (renewalProvidersData || []).forEach(provider => {
+                    const entry = {};
+                    (provider.credentialFields || []).forEach(field => {
+                        const input = document.getElementById('renewal_' + provider.id + '_' + field.name);
+                        entry[field.name] = input ? input.value : '';
+                    });
+                    renewalConfigData[provider.id] = entry;
+                });
                 const renewalResponse = await fetch('/api/renewal-config', {
                     headers: { 'Content-Type': 'application/json' },
                     method: 'POST',
@@ -7404,6 +7432,21 @@ async function handleApiRequest(request) {
     }
   }
 
+  // 获取已注册的自动续期服务商及其凭据字段定义（供设置页动态渲染：新增适配器后设置页自动出现该家，不用改页面）
+  if (path === '/api/renewal-providers' && request.method === 'GET') {
+    try {
+      const providers = RENEWAL_PROVIDERS.map(p => ({
+        id: p.id,
+        label: p.label,
+        windowDays: p.windowDays,
+        credentialFields: (p.credentialFields || []).map(f => typeof f === 'string' ? { name: f, label: f } : f),
+      }));
+      return jsonResponse(providers);
+    } catch (error) {
+      return jsonResponse({ error: '获取自动续期服务商列表失败' }, 500);
+    }
+  }
+
   
   // ================================
   // 分类管理API
@@ -8487,8 +8530,9 @@ function buildProviderCredentials(provider, renewalConfig) {
   const entry = (renewalConfig && renewalConfig[provider.id]) || {};
   const creds = {};
   for (const field of provider.credentialFields || []) {
-    if (!entry[field]) return null;
-    creds[field] = entry[field];
+    const name = typeof field === 'string' ? field : field.name;
+    if (!entry[name]) return null;
+    creds[name] = entry[name];
   }
   return creds;
 }
@@ -8523,7 +8567,10 @@ const DNSHE_PROVIDER = {
   label: 'DNSHE',
   windowDays: 175,
   stateKey: 'dnshe_renew_state',
-  credentialFields: ['apiKey', 'apiSecret'],
+  credentialFields: [
+    { name: 'apiKey', label: 'API Key', help: '在 DNSHE 控制台「API 管理」中创建' },
+    { name: 'apiSecret', label: 'API Secret', help: '与 API Key 配对的 Secret' },
+  ],
   async listDomains(creds) {
     const all = [];
     let cursorId = 0;
