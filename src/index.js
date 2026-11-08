@@ -4376,6 +4376,20 @@ const getHTMLContent = (title) => `
                                 <span id="testResult" class="ms-2"></span>
                             </div>
                         </div>
+
+                        <hr style="border-color: rgba(255, 255, 255, 0.1);">
+
+                        <h6 class="mb-3" style="display: flex; align-items: center; gap: 5px;"><i class="iconfont icon-arrows-rotate" style="color: white;"></i> 自动续期凭据（API）</h6>
+                        <div class="mb-3">
+                            <label for="dnsheApiKey" class="form-label"><i class="iconfont icon-key"></i> DNSHE API Key</label>
+                            <input type="text" class="form-control" id="dnsheApiKey" placeholder="在 DNSHE 控制台「API 管理」中创建">
+                            <div class="form-text">填写后，DNSHE 的域名会在到期前 175 天内自动续期；两项都留空则不启用</div>
+                        </div>
+                        <div class="mb-3">
+                            <label for="dnsheApiSecret" class="form-label"><i class="iconfont icon-key"></i> DNSHE API Secret</label>
+                            <input type="text" class="form-control" id="dnsheApiSecret" placeholder="与 API Key 配对的 Secret">
+                            <div class="form-text">凭据保存在 KV 中（renewal_config），备份 KV 时会一并带走</div>
+                        </div>
                     </form>
                 </div>
                 <div class="modal-footer">
@@ -4552,7 +4566,7 @@ const getHTMLContent = (title) => `
             // 确保DOM元素已完全加载
             setTimeout(() => {
                 // 使用Promise.all并行加载数据
-                Promise.all([loadDomains(), loadCategories(), loadTelegramConfig()])
+                Promise.all([loadDomains(), loadCategories(), loadTelegramConfig(), loadRenewalConfig()])
                     .then(() => {
                         renderDomainList();
                     })
@@ -5249,6 +5263,24 @@ const getHTMLContent = (title) => `
             }
         }
         
+        // 自动续期凭据配置（存 KV 的 renewal_config，按服务商一份）
+        let renewalConfigData = {};
+
+        // 加载自动续期凭据配置
+        async function loadRenewalConfig() {
+            try {
+                const response = await fetch('/api/renewal-config');
+                if (!response.ok) throw new Error('获取自动续期凭据配置失败');
+
+                renewalConfigData = await response.json();
+                const dnshe = renewalConfigData.dnshe || {};
+                document.getElementById('dnsheApiKey').value = dnshe.apiKey || '';
+                document.getElementById('dnsheApiSecret').value = dnshe.apiSecret || '';
+            } catch (error) {
+                // 忽略自动续期凭据配置加载失败
+            }
+        }
+
         // 保存设置
         async function saveSettings() {
             const expandDomains = document.getElementById('expandDomainsEnabled').checked;
@@ -5286,6 +5318,21 @@ const getHTMLContent = (title) => `
                 }
                 
                 telegramConfig = await response.json();
+
+                // 一并保存自动续期凭据（在已加载的整体配置上更新 dnshe 一份后存回，避免冲掉其他服务商的配置）
+                renewalConfigData.dnshe = {
+                    apiKey: document.getElementById('dnsheApiKey').value,
+                    apiSecret: document.getElementById('dnsheApiSecret').value
+                };
+                const renewalResponse = await fetch('/api/renewal-config', {
+                    headers: { 'Content-Type': 'application/json' },
+                    method: 'POST',
+                    body: JSON.stringify(renewalConfigData)
+                });
+                if (!renewalResponse.ok) {
+                    throw new Error('自动续期凭据保存失败');
+                }
+
                 showAlert('success', '设置保存成功');
                 
                 // 如果开启了默认展开，立即执行展开操作
@@ -7336,6 +7383,27 @@ async function handleApiRequest(request) {
     }
   }
 
+  // 获取自动续期凭据配置
+  if (path === '/api/renewal-config' && request.method === 'GET') {
+    try {
+      const config = await getRenewalConfig();
+      return jsonResponse(config);
+    } catch (error) {
+      return jsonResponse({ error: '获取自动续期凭据配置失败' }, 500);
+    }
+  }
+
+  // 保存自动续期凭据配置
+  if (path === '/api/renewal-config' && request.method === 'POST') {
+    try {
+      const configData = await request.json();
+      const config = await saveRenewalConfig(configData);
+      return jsonResponse(config);
+    } catch (error) {
+      return jsonResponse({ error: '保存自动续期凭据配置失败: ' + error.message }, 400);
+    }
+  }
+
   
   // ================================
   // 分类管理API
@@ -8239,6 +8307,10 @@ async function checkExpiringDomains() {
   // 获取Telegram配置
   const telegramConfig = await getTelegramConfigWithToken();
   const globalNotifyDays = telegramConfig.enabled ? telegramConfig.notifyDays : 30;
+
+  // API 自动续期：先把进入各服务商续期窗口的域名续掉，
+  // 后面的到期提醒逻辑会用续期后的新到期日期判断，避免刚续完又发临期提醒
+  await autoRenewDomains(domains, telegramConfig);
   
   // 判断域名是否符合过期提醒条件的辅助函数
   function needsExpiryNotify(domain) {
@@ -8345,6 +8417,297 @@ async function checkExpiringDomains() {
       // 静默处理Telegram通知发送失败
     }
   }
+}
+
+// ================================
+// API 自动续期（在定时检查时顺带执行）
+// 架构：每个支持 API 续期的注册商是一个“适配器”，统一注册在 RENEWAL_PROVIDERS 里。
+// 通用流程只做四件事：拉该商账号清单 → 与面板域名匹配 → 窗口内调续期 → 同步到期日并 TG 播报。
+// 新增一家时照 DNSHE 适配器的形状再写一个对象（credentials / listDomains / renewDomain）即可，不用动通用流程。
+// 凭据约定：凭据存在 KV 的 renewal_config 里（在面板「设置 → 自动续期凭据」中填写），按服务商各存一份：
+// { <服务商id>: { <字段>: <值> } }；每家把自己需要的字段名登记在适配器的 credentialFields 里，
+// 通用层照单组装，任一字段缺失该商整体跳过。备份 KV 即包含全部续期配置，不依赖 Worker 环境变量。
+// 开关逻辑：某域名在面板里单独关了到期提醒（notifySettings.enabled=false）的，不自动续（尊重单域名设置）；
+// 全局层面由各商自己的凭据决定——没配凭据的商整体跳过。
+// 安全线：已过期的域名一律不自动续（多家都有付费赎回/宽限规则，留给原有到期提醒人工处理）。
+// ================================
+
+// 通用请求助手：发送请求并解析 JSON；HTTP 非 2xx 抛异常，成功与否由各适配器按自家响应判断
+async function renewalApiRequest(url, { method = 'GET', headers = {}, body = null } = {}) {
+  const options = { method, headers };
+  if (body !== null) {
+    options.headers = { ...headers, 'Content-Type': 'application/json' };
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(url, options);
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    // 非 JSON 响应：data 保持 null，交适配器处理
+  }
+  if (!response.ok) {
+    const msg = (data && (data.message || data.error)) || ('HTTP ' + response.status);
+    const code = data && data.error_code ? ' (' + data.error_code + ')' : '';
+    throw new Error(msg + code);
+  }
+  return data;
+}
+
+// 读取 KV 中的续期凭据配置：{ <服务商id>: { <字段>: <值> } }，解析失败按空配置处理
+async function getRenewalConfig() {
+  try {
+    return JSON.parse(await DOMAIN_MONITOR.get('renewal_config') || '{}');
+  } catch (e) {
+    return {};
+  }
+}
+
+// 保存续期凭据配置（供设置接口调用）：只保留 { 服务商id: { 字段: 字符串 } } 形状，空字符串表示清除该字段
+async function saveRenewalConfig(configData) {
+  if (!configData || typeof configData !== 'object' || Array.isArray(configData)) {
+    throw new Error('凭据配置格式不正确');
+  }
+  const config = {};
+  for (const [providerId, fields] of Object.entries(configData)) {
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    config[providerId] = {};
+    for (const [field, value] of Object.entries(fields)) {
+      if (typeof value === 'string') {
+        config[providerId][field] = value;
+      }
+    }
+  }
+  await DOMAIN_MONITOR.put('renewal_config', JSON.stringify(config));
+  return config;
+}
+
+// 按适配器声明组装凭据：credentialFields 列出的字段都必须有非空值，否则返回 null（该商整体跳过）
+function buildProviderCredentials(provider, renewalConfig) {
+  const entry = (renewalConfig && renewalConfig[provider.id]) || {};
+  const creds = {};
+  for (const field of provider.credentialFields || []) {
+    if (!entry[field]) return null;
+    creds[field] = entry[field];
+  }
+  return creds;
+}
+
+// ---------- DNSHE 适配器 ----------
+// 凭据字段：apiKey / apiSecret（值在面板设置里填写，存 KV 的 renewal_config.dnshe；Key 在 DNSHE 控制台「API 管理」创建）
+// 官方窗口：到期前 180 天可免费续；执行阈值取 175 天留余量
+const DNSHE_API_BASE = 'https://api005.dnshe.com/index.php?m=domain_hub';
+
+async function dnsheApi(creds, endpoint, action, { method = 'GET', params = {}, body = null } = {}) {
+  const url = new URL(DNSHE_API_BASE);
+  url.searchParams.set('endpoint', endpoint);
+  url.searchParams.set('action', action);
+  for (const [k, v] of Object.entries(params)) {
+    url.searchParams.set(k, String(v));
+  }
+  const data = await renewalApiRequest(url.toString(), {
+    method,
+    headers: { 'X-API-Key': creds.apiKey, 'X-API-Secret': creds.apiSecret },
+    body,
+  });
+  if (!data || data.success !== true) {
+    const msg = (data && (data.message || data.error)) || '响应异常';
+    const code = data && data.error_code ? ' (' + data.error_code + ')' : '';
+    throw new Error('DNSHE API ' + action + ' 失败: ' + msg + code);
+  }
+  return data;
+}
+
+const DNSHE_PROVIDER = {
+  id: 'dnshe',
+  label: 'DNSHE',
+  windowDays: 175,
+  stateKey: 'dnshe_renew_state',
+  credentialFields: ['apiKey', 'apiSecret'],
+  async listDomains(creds) {
+    const all = [];
+    let cursorId = 0;
+    for (let page = 0; page < 10; page++) {
+      const data = await dnsheApi(creds, 'subdomains', 'list', {
+        params: {
+          cursor_id: cursorId,
+          per_page: 500,
+          fields: 'id,subdomain,rootdomain,full_domain,status,expires_at,never_expires',
+        },
+      });
+      const items = Array.isArray(data.subdomains) ? data.subdomains : [];
+      for (const item of items) {
+        if (!item || !item.full_domain) continue;
+        all.push({
+          providerRef: item.id,
+          fullDomain: String(item.full_domain).toLowerCase(),
+          status: item.status || 'active',
+          expiresAt: item.expires_at ? String(item.expires_at).slice(0, 10) : null,
+          neverExpires: item.never_expires === 1 || item.never_expires === true,
+        });
+      }
+      if (data.pagination && data.pagination.has_more && data.pagination.next_cursor_id != null) {
+        cursorId = data.pagination.next_cursor_id;
+      } else {
+        break;
+      }
+    }
+    return all;
+  },
+  async renewDomain(creds, remote) {
+    const result = await dnsheApi(creds, 'subdomains', 'renew', {
+      method: 'POST',
+      body: { subdomain_id: remote.providerRef },
+    });
+    return {
+      newExpiresAt: result.new_expires_at ? String(result.new_expires_at).slice(0, 10) : null,
+      chargedAmount: result.charged_amount,
+    };
+  },
+};
+
+// 已接入的续期适配器清单（新增服务商往这里加）
+const RENEWAL_PROVIDERS = [DNSHE_PROVIDER];
+
+// 自动续期主流程（通用）：逐个适配器执行，规则对所有服务商一致
+async function autoRenewDomains(domains, telegramConfig) {
+  const today = new Date();
+  const renewalConfig = await getRenewalConfig();
+  const renewed = [];
+  const failed = [];
+  let domainsChanged = false;
+
+  for (const provider of RENEWAL_PROVIDERS) {
+    const creds = buildProviderCredentials(provider, renewalConfig);
+    if (!creds) continue;
+
+    let remoteList;
+    try {
+      remoteList = await provider.listDomains(creds);
+    } catch (e) {
+      // 清单都拉不到（多半是凭据未配好）：该商静默跳过，避免每天报错刷屏
+      continue;
+    }
+
+    // 失败去重状态：同一域名同一到期日的失败只通知一次，按服务商分别存 KV
+    let renewState = {};
+    try {
+      renewState = JSON.parse(await DOMAIN_MONITOR.get(provider.stateKey) || '{}');
+    } catch (e) {
+      renewState = {};
+    }
+    let stateChanged = false;
+
+    for (const remote of remoteList) {
+      if (!remote || !remote.fullDomain) continue;
+      if (remote.neverExpires) continue;
+      if (remote.status && remote.status !== 'active') continue;
+      if (!remote.expiresAt) continue;
+
+      const daysLeft = Math.ceil((new Date(remote.expiresAt).getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+      if (daysLeft < 1 || daysLeft > provider.windowDays) continue;
+
+      // 与面板记录匹配（同名可能多条）
+      const matched = domains.filter(d => String(d.name || '').trim().toLowerCase().replace(/\.$/, '') === remote.fullDomain);
+      // 单域名开关：任一同名记录单独关了到期提醒，就尊重它、不自动续
+      if (matched.some(d => d.notifySettings && d.notifySettings.enabled === false)) continue;
+
+      try {
+        const result = await provider.renewDomain(creds, remote);
+        renewed.push({
+          providerLabel: provider.label,
+          name: remote.fullDomain,
+          oldExpiryDate: remote.expiresAt,
+          newExpiryDate: result.newExpiresAt,
+          chargedAmount: result.chargedAmount,
+        });
+        if (result.newExpiresAt) {
+          matched.forEach(d => {
+            d.expiryDate = result.newExpiresAt;
+            d.updatedAt = new Date().toISOString();
+            domainsChanged = true;
+          });
+        }
+        if (renewState[remote.fullDomain]) {
+          delete renewState[remote.fullDomain];
+          stateChanged = true;
+        }
+      } catch (e) {
+        const alreadyNotified = renewState[remote.fullDomain] && renewState[remote.fullDomain].failedForExpiry === remote.expiresAt;
+        if (!alreadyNotified) {
+          failed.push({
+            providerLabel: provider.label,
+            name: remote.fullDomain,
+            expiryDate: remote.expiresAt,
+            error: e.message,
+          });
+          renewState[remote.fullDomain] = { failedForExpiry: remote.expiresAt, at: new Date().toISOString() };
+          stateChanged = true;
+        }
+      }
+    }
+
+    if (stateChanged) {
+      await DOMAIN_MONITOR.put(provider.stateKey, JSON.stringify(renewState));
+    }
+  }
+
+  if (domainsChanged) {
+    await DOMAIN_MONITOR.put('domains', JSON.stringify(domains));
+  }
+
+  // 发送续期结果通知（沿用全局 Telegram 配置与开关）
+  if ((renewed.length > 0 || failed.length > 0) &&
+      telegramConfig.enabled &&
+      ((telegramConfig.botToken || typeof TG_TOKEN !== 'undefined') &&
+       (telegramConfig.chatId || typeof TG_ID !== 'undefined'))) {
+    try {
+      await sendAutoRenewNotification(telegramConfig, renewed, failed);
+    } catch (e) {
+      // 通知发送失败静默处理
+    }
+  }
+}
+
+// 发送自动续期结果通知（多服务商合并一条，每条带服务商名）
+async function sendAutoRenewNotification(config, renewed, failed) {
+  const title = '✅ <b>域名自动续期</b> ✅';
+  const separator = '======================';
+
+  let message = title + '\n' + separator + '\n\n';
+
+  renewed.forEach((item, index) => {
+    if (index > 0) {
+      message += '\n';
+    }
+    message += '🌍 域名: ' + escapeHtmlBackend(item.name) + '\n';
+    message += '🏬 服务商: ' + escapeHtmlBackend(item.providerLabel) + '\n';
+    message += '📅 原到期日期: ' + formatDate(item.oldExpiryDate) + '\n';
+    if (item.newExpiryDate) {
+      message += '📅 新到期日期: ' + formatDate(item.newExpiryDate) + '\n';
+    }
+    if (item.chargedAmount !== undefined && item.chargedAmount !== null) {
+      message += '💰 续期费用: ' + escapeHtmlBackend(String(item.chargedAmount)) + '\n';
+    }
+  });
+
+  if (failed.length > 0) {
+    if (renewed.length > 0) {
+      message += '\n━━━━━━━━━━━━━━━━\n\n';
+    }
+    message += '⚠️ <b>以下域名自动续期失败，请手动处理:</b>\n\n';
+    failed.forEach((item, index) => {
+      if (index > 0) {
+        message += '\n';
+      }
+      message += '🌍 域名: ' + escapeHtmlBackend(item.name) + '\n';
+      message += '🏬 服务商: ' + escapeHtmlBackend(item.providerLabel) + '\n';
+      message += '📅 到期日期: ' + formatDate(item.expiryDate) + '\n';
+      message += '❌ 失败原因: ' + escapeHtmlBackend(item.error) + '\n';
+    });
+  }
+
+  return await sendTelegramMessage(config, message);
 }
 
 // 发送域名通知（即将到期或已过期）
