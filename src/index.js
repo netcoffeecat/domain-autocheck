@@ -4280,6 +4280,14 @@ const getHTMLContent = (title) => `
                             <input type="text" class="form-control" id="categoryDescription" placeholder="分类描述" maxlength="100">
                         </div>
                         <div class="mb-3">
+                            <label for="categoryRenewalProvider" class="form-label"><i class="iconfont icon-arrows-rotate"></i> 自动续期服务商</label>
+                            <select class="form-select" id="categoryRenewalProvider">
+                                <option value="">不启用自动续期</option>
+                            </select>
+                            <div class="form-text">给这个分类选一家支持 API 续期的服务商并填它的凭据，该分类下的域名到期时会自动续期</div>
+                        </div>
+                        <div id="categoryRenewalFields"></div>
+                        <div class="mb-3">
                             <button type="button" class="btn btn-primary" id="addCategoryBtn">
                                 <i class="iconfont icon-jia" style="color: white;"></i> <span style="color: white;">添加分类</span>
                             </button>
@@ -4375,15 +4383,6 @@ const getHTMLContent = (title) => `
                                 <button type="button" class="btn btn-info" id="testTelegramBtn"><i class="iconfont icon-paper-plane" style="color: white;"></i> <span style="color: white;">测试Telegram通知</span></button>
                                 <span id="testResult" class="ms-2"></span>
                             </div>
-                        </div>
-
-                        <hr style="border-color: rgba(255, 255, 255, 0.1);">
-
-                        <h6 class="mb-3" style="display: flex; align-items: center; gap: 5px;"><i class="iconfont icon-arrows-rotate" style="color: white;"></i> 自动续期凭据（API）</h6>
-                        <div id="renewalProvidersSettings">
-                            <div class="form-text">加载中…</div>
-                        </div>
-                        <div class="form-text mb-3">凭据按服务商保存在 KV 中（renewal_config），备份 KV 时会一并带走；某家凭据全部留空则不启用该家的自动续期</div>
                     </form>
                 </div>
                 <div class="modal-footer">
@@ -4560,7 +4559,7 @@ const getHTMLContent = (title) => `
             // 确保DOM元素已完全加载
             setTimeout(() => {
                 // 使用Promise.all并行加载数据
-                Promise.all([loadDomains(), loadCategories(), loadTelegramConfig(), loadRenewalConfig()])
+                Promise.all([loadDomains(), loadCategories(), loadTelegramConfig()])
                     .then(() => {
                         renderDomainList();
                     })
@@ -4605,12 +4604,21 @@ const getHTMLContent = (title) => `
             if (addCategoryBtn) {
                 addCategoryBtn.addEventListener('click', addCategory);
             }
+
+            // 添加分类表单里切换续期服务商时，重新渲染凭据输入框
+            const categoryRenewalProviderSelect = document.getElementById('categoryRenewalProvider');
+            if (categoryRenewalProviderSelect) {
+                categoryRenewalProviderSelect.addEventListener('change', function() {
+                    renderCategoryRenewalFields('categoryRenewalFields', this.value, {});
+                });
+            }
             
             // 分类管理模态框显示时加载分类列表
             const categoryModal = document.getElementById('categoryManageModal');
             if (categoryModal) {
                 categoryModal.addEventListener('shown.bs.modal', function() {
                     loadCategories();
+                    loadRenewalProviders();
                 });
             }
             
@@ -5257,54 +5265,488 @@ const getHTMLContent = (title) => `
             }
         }
         
-        // 自动续期凭据配置（存 KV 的 renewal_config，按服务商一份）
-        let renewalConfigData = {};
-        let renewalProvidersData = [];
-
-        // 加载自动续期服务商与凭据配置，并按服务商动态渲染凭据输入框（新增适配器后自动出现，不用改设置页）
-        async function loadRenewalConfig() {
-            try {
-                const [providersResponse, configResponse] = await Promise.all([
-                    fetch('/api/renewal-providers'),
-                    fetch('/api/renewal-config')
-                ]);
-                if (!providersResponse.ok || !configResponse.ok) throw new Error('获取自动续期配置失败');
-
-                renewalProvidersData = await providersResponse.json();
-                renewalConfigData = await configResponse.json();
-
-                const container = document.getElementById('renewalProvidersSettings');
-                if (!Array.isArray(renewalProvidersData) || renewalProvidersData.length === 0) {
-                    container.innerHTML = '<div class="form-text">暂无支持 API 续期的服务商</div>';
+        // 保存设置按钮
+            document.getElementById('saveSettingsBtn').addEventListener('click', saveSettings);
+            
+            // 测试Telegram按钮
+            document.getElementById('testTelegramBtn').addEventListener('click', testTelegram);
+            
+            // 域名通知设置 - 全局/自定义切换
+            document.getElementById('useGlobalSettings').addEventListener('change', function() {
+                document.getElementById('domainNotifySettings').style.display = this.checked ? 'none' : 'block';
+            });
+            
+            // 窗口大小变化监听器 - 用于移动端排序修复
+            let resizeTimer;
+            let lastWidth = window.innerWidth;
+            
+            window.addEventListener('resize', function() {
+                // 防抖处理，避免频繁重新渲染
+                clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(function() {
+                    const currentWidth = window.innerWidth;
+                    
+                    // 只有在宽度发生显著变化时才重新渲染（避免移动端滑动时地址栏显示/隐藏导致的高度变化）
+                    const widthChanged = Math.abs(currentWidth - lastWidth) > 50;
+                    
+                    if (widthChanged) {
+                        // 重新渲染域名列表以适应新的屏幕尺寸
+                        renderDomainList();
+                        lastWidth = currentWidth;
+                    }
+                }, 300); // 增加延迟时间，减少触发频率
+            });
+            
+            // 根据注册时间和续期周期自动计算到期日期
+            function calculateExpiryDate() {
+                const registrationDate = document.getElementById('registrationDate').value;
+                const lastRenewed = document.getElementById('lastRenewed').value;
+                const renewCycleValue = parseInt(document.getElementById('renewCycleValue').value) || 1;
+                const renewCycleUnit = document.getElementById('renewCycleUnit').value;
+                
+                if (!registrationDate) {
+                    // 如果没有注册时间，清空到期日期
+                    document.getElementById('expiryDate').value = '';
                     return;
                 }
-
-                let html = '';
-                renewalProvidersData.forEach(provider => {
-                    html += '<div class="mb-2 fw-bold">' + escapeHtml(provider.label) + '</div>';
-                    (provider.credentialFields || []).forEach(field => {
-                        const inputId = 'renewal_' + provider.id + '_' + field.name;
-                        html += '<div class="mb-3">' +
-                            '<label for="' + inputId + '" class="form-label"><i class="iconfont icon-key"></i> ' + escapeHtml(field.label || field.name) + '</label>' +
-                            '<input type="text" class="form-control" id="' + inputId + '" placeholder="' + escapeHtml(field.help || '') + '">' +
-                            '</div>';
+                
+                // 如果有上次续期时间，则从上次续期时间开始计算；否则从注册时间开始计算
+                const baseDate = lastRenewed ? new Date(lastRenewed) : new Date(registrationDate);
+                const expiryDate = new Date(baseDate);
+                
+                // 根据续期周期单位计算到期日期
+                switch(renewCycleUnit) {
+                    case 'year':
+                        expiryDate.setFullYear(baseDate.getFullYear() + renewCycleValue);
+                        break;
+                    case 'month':
+                        expiryDate.setMonth(baseDate.getMonth() + renewCycleValue);
+                        break;
+                    case 'day':
+                        expiryDate.setDate(baseDate.getDate() + renewCycleValue);
+                        break;
+                }
+                
+                // 格式化日期为 YYYY-MM-DD 格式
+                const formattedDate = expiryDate.toISOString().split('T')[0];
+                document.getElementById('expiryDate').value = formattedDate;
+            }
+            
+            // 监听备注文本和颜色变化
+            document.getElementById('customNote').addEventListener('input', updateNotePreview);
+            document.getElementById('noteColor').addEventListener('change', updateNotePreview);
+            
+            // 当模态框显示时初始化预览
+            document.getElementById('addDomainModal').addEventListener('shown.bs.modal', function() {
+                updateNotePreview();
+            });
+            
+            // 排序选项点击事件
+            document.querySelectorAll('.sort-option').forEach(option => {
+                option.addEventListener('click', async function(e) {
+                    e.preventDefault();
+                    currentSortField = this.dataset.sort;
+                    currentSortOrder = this.dataset.order;
+                    await renderDomainList();
+                    
+                                // 不再更新排序按钮文本，只保留"域名排序"
+            // 但仍然需要更新勾选状态
+                    
+                    // 更新勾选状态
+                    document.querySelectorAll('.sort-option').forEach(opt => {
+                        opt.classList.remove('active');
                     });
+                    this.classList.add('active');
                 });
-                container.innerHTML = html;
+            });
+            
+            // 视图模式选项点击事件
+            document.querySelectorAll('.view-option').forEach(option => {
+                option.addEventListener('click', function(e) {
+                    const newViewMode = this.dataset.view;
+                    
+                    // 设置视图模式
+                    viewMode = newViewMode;
+                    
+                    // 直接获取所有卡片详情元素
+                    const allDetails = document.querySelectorAll('.domain-card .collapse');
+                    
+                    // 根据模式直接进行操作
+                    if (newViewMode === 'expand-all') {
+                        // 直接展开所有卡片
+                        allDetails.forEach(detail => {
+                            // 手动添加show类，强制显示
+                            detail.classList.add('show');
+                            detail.style.height = 'auto'; // 确保内容显示
+                            detail.style.overflow = 'visible';
+                            
+                            // 获取父级卡片
+                            const domainCard = detail.closest('.domain-card');
+                            if (domainCard) {
+                                // 在父级卡片中寻找toggle按钮
+                                const btn = domainCard.querySelector('.toggle-details');
+                                if (btn) {
+                                    btn.classList.remove('collapsed');
+                                    btn.setAttribute('aria-expanded', 'true');
+                                }
+                                // 添加展开状态类，使域名可以换行显示
+                                domainCard.classList.add('expanded');
+                            }
+                        });
+                        
+                        // 高亮"全部展开"按钮
+                        document.querySelectorAll('.view-option').forEach(btn => {
+                            if (btn.dataset.view === 'expand-all') {
+                                btn.classList.remove('btn-outline-info');
+                                btn.classList.add('btn-info');
+                            } else {
+                                btn.classList.add('btn-outline-info');
+                                btn.classList.remove('btn-info');
+                            }
+                        });
+                    } else if (newViewMode === 'collapse-all' || newViewMode === 'auto-collapse') {
+                        // 直接折叠所有卡片
+                        allDetails.forEach(detail => {
+                            // 手动移除show类，强制隐藏
+                            detail.classList.remove('show');
+                            detail.style.height = '0px'; // 强制隐藏高度
+                            detail.style.overflow = 'hidden';
+                            
+                            // 获取父级卡片
+                            const domainCard = detail.closest('.domain-card');
+                            if (domainCard) {
+                                // 在父级卡片中寻找toggle按钮
+                                const btn = domainCard.querySelector('.toggle-details');
+                                if (btn) {
+                                    btn.classList.add('collapsed');
+                                    btn.setAttribute('aria-expanded', 'false');
+                                }
+                                // 移除展开状态类，恢复省略号显示
+                                domainCard.classList.remove('expanded');
+                            }
+                        });
+                        
+                        // 高亮"全部折叠"按钮
+                        document.querySelectorAll('.view-option').forEach(btn => {
+                            if (btn.dataset.view === 'collapse-all') {
+                                btn.classList.remove('btn-outline-info');
+                                btn.classList.add('btn-info');
+                            } else {
+                                btn.classList.add('btn-outline-info');
+                                btn.classList.remove('btn-info');
+                            }
+                        });
+                    }
+                });
+            });
+            
+            // 分类筛选变更事件
+            document.getElementById('categoryFilter').addEventListener('change', function() {
+                currentCategoryFilter = this.value;
+                renderDomainList();
+            });
+            
+            // 添加点击空白处折叠卡片的功能
+            document.addEventListener('click', function(e) {
+                // 检查是否处于"折叠"模式
+                const collapseButton = document.querySelector('.view-option[data-view="collapse-all"]');
+                if (collapseButton && collapseButton.classList.contains('btn-info')) {
+                    // 确保点击的是空白处，而不是卡片内部或其他功能按钮
+                    if (
+                        !e.target.closest('.domain-card') && 
+                        !e.target.closest('.btn') && 
+                        !e.target.closest('.modal') && 
+                        !e.target.closest('.navbar') &&
+                        !e.target.closest('.page-header') &&
+                        !e.target.closest('.dropdown-menu')
+                    ) {
+                        // 获取所有展开的卡片
+                        const expandedCards = document.querySelectorAll('.domain-card .collapse.show');
+                        
+                        // 折叠所有展开的卡片
+                        expandedCards.forEach(detail => {
+                            // 使用Bootstrap的collapse方法实现平滑的折叠动画
+                            const bsCollapse = bootstrap.Collapse.getInstance(detail);
+                            if (bsCollapse) {
+                                bsCollapse.hide();
+                            }
+                            
+                            // 获取父级卡片
+                            const domainCard = detail.closest('.domain-card');
+                            if (domainCard) {
+                                // 监听折叠完成事件，移除展开状态类
+                                detail.addEventListener('hidden.bs.collapse', function() {
+                                    // 移除展开状态类，恢复省略号显示
+                                    domainCard.classList.remove('expanded');
+                                }, {once: true}); // 只执行一次
+                                
+                                // 在父级卡片中寻找toggle按钮并更新状态
+                                const btn = domainCard.querySelector('.toggle-details');
+                                if (btn) {
+                                    btn.classList.add('collapsed');
+                                    btn.setAttribute('aria-expanded', 'false');
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+            
+            // 初始加载时设置默认排序选项
+            const defaultSortOption = document.querySelector('.sort-option[data-sort="' + currentSortField + '"][data-order="' + currentSortOrder + '"]');
+            if (defaultSortOption) {
+                // 不再更新排序按钮文本，保持"域名排序"
+                
+                // 设置默认选项为激活状态
+                defaultSortOption.classList.add('active');
+            } else {
+                // 如果找不到匹配的选项，默认选择按后缀升序
+                const suffixAscOption = document.querySelector('.sort-option[data-sort="suffix"][data-order="asc"]');
+                if (suffixAscOption) {
+                    suffixAscOption.classList.add('active');
+                    currentSortField = 'suffix';
+                    currentSortOrder = 'asc';
+                }
+            }
+            
+            // 表头排序点击事件
+            document.addEventListener('click', async function(e) {
+                if (e.target.tagName === 'TH') {
+                    const field = e.target.dataset.sort;
+                    if (field) {
+                        if (currentSortField === field) {
+                            // 切换排序顺序
+                            currentSortOrder = currentSortOrder === 'asc' ? 'desc' : 'asc';
+                        } else {
+                            currentSortField = field;
+                            currentSortOrder = 'asc';
+                        }
+                        await renderDomainList();
+                    }
+                }
+            });
+            
+            // 主题切换功能
+            const themeToggleBtn = document.getElementById('themeToggleBtn');
 
-                // 回填已保存的值
-                renewalProvidersData.forEach(provider => {
-                    const entry = renewalConfigData[provider.id] || {};
-                    (provider.credentialFields || []).forEach(field => {
-                        const input = document.getElementById('renewal_' + provider.id + '_' + field.name);
-                        if (input) input.value = entry[field.name] || '';
-                    });
-                });
-            } catch (error) {
-                // 忽略自动续期凭据配置加载失败
+            // 初始化主题
+            const savedTheme = localStorage.getItem('theme') || 'light';
+            document.documentElement.setAttribute('data-theme', savedTheme);
+            themeToggleBtn.title = savedTheme === 'dark' ? '切换到亮色主题' : '切换到暗色主题';
+
+            themeToggleBtn.addEventListener('click', function() {
+                const currentTheme = document.documentElement.getAttribute('data-theme');
+                const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+
+                document.documentElement.setAttribute('data-theme', newTheme);
+                localStorage.setItem('theme', newTheme);
+                themeToggleBtn.title = newTheme === 'dark' ? '切换到亮色主题' : '切换到暗色主题';
+            });
+        }
+        
+        // 自定义备注颜色预览函数
+        function updateNotePreview() {
+            const noteText = document.getElementById('customNote').value.trim();
+            const noteColor = document.getElementById('noteColor').value;
+            const notePreview = document.getElementById('notePreview');
+            
+            if (noteText) {
+                // 更新预览文字和显示状态
+                notePreview.textContent = noteText;
+                notePreview.style.display = 'inline-block';
+                
+                // 移除所有颜色类但保留基本样式
+                notePreview.className = 'text-info note-preview';
+                // 添加选中的颜色类
+                notePreview.classList.add(noteColor);
+                
+                // 使用内联样式强制设置颜色
+                const colorMap = {
+                    'tag-blue': '#3B82F6',
+                    'tag-green': '#10B981',
+                    'tag-red': '#EF4444',
+                    'tag-yellow': '#F59E0B',
+                    'tag-purple': '#8B5CF6',
+                    'tag-pink': '#EC4899',
+                    'tag-indigo': '#6366F1',
+                    'tag-gray': '#6B7280'
+                };
+                notePreview.style.backgroundColor = colorMap[noteColor] || '#3B82F6';
+            } else {
+                notePreview.style.display = 'none';
             }
         }
+        
+        // 加载所有域名
+        async function loadDomains() {
+            // 先尝试显示加载状态，但不阻止后续操作
+            try {
+                showDomainLoadingState();
+            } catch (loadingError) {
+                // 继续执行，不要因为显示加载状态失败而中断
+            }
+            
+            try {
+                const response = await fetch('/api/domains');
+                
+                if (!response.ok) {
+                    throw new Error('获取域名列表失败: ' + response.status);
+                }
+                
+                domains = await response.json();
+                
+                return domains; // 返回加载的域名数据
+            } catch (error) {
+                showAlert('danger', '加载域名列表失败: ' + error.message);
+                throw error;
+            }
+        }
+        
+        // 显示域名加载中的状态
+        function showDomainLoadingState() {
+            // 使用document.querySelector作为备选方法
+            const domainListContainer = document.getElementById('domainListContainer') || document.querySelector('#domainListContainer');
+            
+            if (!domainListContainer) {
+                return;
+            }
+            
+            try {
+                const cardLayout = telegramConfig.cardLayout || '4';
+                const numColumns = parseInt(cardLayout);
+                let html = '';
+                
+                for (let i = 0; i < numColumns; i++) {
+                    const colClass = numColumns === 4 ? 'col-md-6 col-lg-3' : 'col-md-6 col-lg-4';
+                    html += '<div class="' + colClass + ' domain-column px-1-5">';
+                    html += generateSkeletonCard();
+                    html += generateSkeletonCard();
+                    html += '</div>';
+                }
+                
+                domainListContainer.innerHTML = html;
+            } catch (error) {
+                // 忽略骨架屏设置失败
+            }
+        }
+        
+        // 生成骨架屏卡片（匹配实际卡片折叠态的结构和尺寸）
+        function generateSkeletonCard() {
+            return '<div class="card domain-card skeleton-card mb-2">' +
+                '<div class="skeleton-header">' +
+                    '<div class="skeleton-dot"></div>' +
+                    '<div class="skeleton-domain">' +
+                        '<div class="skeleton-text-lg"></div>' +
+                        '<div class="skeleton-text-sm"></div>' +
+                    '</div>' +
+                    '<div class="skeleton-status">' +
+                        '<div class="skeleton-badge"></div>' +
+                        '<div class="skeleton-toggle"></div>' +
+                    '</div>' +
+                '</div>' +
+            '</div>';
+        }
+        
+        // 加载Telegram配置
+        async function loadTelegramConfig() {
+            try {
+                const response = await fetch('/api/telegram/config');
+                if (!response.ok) throw new Error('获取Telegram配置失败');
+                
+                telegramConfig = await response.json();
+                
+                // 更新表单
+                document.getElementById('expandDomainsEnabled').checked = telegramConfig.expandDomains || false;
+                
+                // 设置进度样式单选框
+                const progressStyle = telegramConfig.progressStyle || 'bar';
+                if (progressStyle === 'bar') {
+                    document.getElementById('progressStyleBar').checked = true;
+                } else {
+                    document.getElementById('progressStyleCircle').checked = true;
+                }
 
+                // 设置卡片布局单选框
+                const cardLayout = telegramConfig.cardLayout || '4';
+                if (cardLayout === '4') {
+                    document.getElementById('cardLayout4').checked = true;
+                } else {
+                    document.getElementById('cardLayout3').checked = true;
+                }
+                
+                document.getElementById('telegramEnabled').checked = telegramConfig.enabled;
+                document.getElementById('telegramSettings').style.display = telegramConfig.enabled ? 'block' : 'none';
+                document.getElementById('notifyDays').value = telegramConfig.notifyDays || 30;
+
+                // 如果配置了默认展开域名，且当前不在"全部展开"模式
+                if (telegramConfig.expandDomains && viewMode !== 'expand-all') {
+                    // 设置视图模式
+                    viewMode = 'expand-all';
+                    // 尝试触发一次视图更新(如果域名列表已经加载)
+                    setTimeout(() => {
+                        const expandBtn = document.querySelector('.view-option[data-view="expand-all"]');
+                        if (expandBtn) {
+                            // 更新按钮状态
+                            document.querySelectorAll('.view-option').forEach(btn => {
+                                if (btn.dataset.view === 'expand-all') {
+                                    btn.classList.remove('btn-outline-info');
+                                    btn.classList.add('btn-info');
+                                } else {
+                                    btn.classList.add('btn-outline-info');
+                                    btn.classList.remove('btn-info');
+                                }
+                            });
+                            // 实际执行展开逻辑
+                            // 直接调用click可能会导致重复请求或逻辑冲突，这里直接操作DOM
+                            const allDetails = document.querySelectorAll('.domain-card .collapse');
+                            allDetails.forEach(detail => {
+                                detail.classList.add('show');
+                                detail.style.height = 'auto';
+                                detail.style.overflow = 'visible';
+                                const domainCard = detail.closest('.domain-card');
+                                if (domainCard) {
+                                    const btn = domainCard.querySelector('.toggle-details');
+                                    if (btn) {
+                                        btn.classList.remove('collapsed');
+                                        btn.setAttribute('aria-expanded', 'true');
+                                    }
+                                    domainCard.classList.add('expanded');
+                                }
+                            });
+                        }
+                    }, 500); // 稍微延迟以确保DOM渲染
+                }
+                
+                // 处理聊天ID的显示
+                if (telegramConfig.chatIdFromEnv) {
+                    // 如果聊天ID来自环境变量，显示固定文本
+                    document.getElementById('telegramChatId').value = '';
+                    document.getElementById('telegramChatId').placeholder = '已通过环境变量配置';
+                    document.getElementById('telegramChatId').disabled = false; // 允许用户编辑
+                } else {
+                    // 显示用户设置的聊天ID
+                    document.getElementById('telegramChatId').value = telegramConfig.chatId || '';
+                    document.getElementById('telegramChatId').placeholder = '如已在环境变量中配置则可留空';
+                    document.getElementById('telegramChatId').disabled = false;
+                }
+                
+                // 处理Token的显示
+                if (telegramConfig.tokenFromEnv) {
+                    // 如果Token来自环境变量，显示固定文本
+                    document.getElementById('telegramToken').value = '';
+                    document.getElementById('telegramToken').placeholder = '已通过环境变量配置';
+                    document.getElementById('telegramToken').disabled = false; // 允许用户编辑
+                } else {
+                    // 显示用户设置的Token
+                    document.getElementById('telegramToken').value = telegramConfig.botToken || '';
+                    document.getElementById('telegramToken').placeholder = '如已在环境变量中配置则可留空';
+                    document.getElementById('telegramToken').disabled = false;
+                }
+            } catch (error) {
+                // 忽略Telegram配置加载失败
+            }
+        }
+        
         // 保存设置
         async function saveSettings() {
             const expandDomains = document.getElementById('expandDomainsEnabled').checked;
@@ -5342,24 +5784,6 @@ const getHTMLContent = (title) => `
                 }
                 
                 telegramConfig = await response.json();
-
-                // 一并保存自动续期凭据（按渲染出的服务商逐个收集，在已加载的整体配置上更新后存回）
-                (renewalProvidersData || []).forEach(provider => {
-                    const entry = {};
-                    (provider.credentialFields || []).forEach(field => {
-                        const input = document.getElementById('renewal_' + provider.id + '_' + field.name);
-                        entry[field.name] = input ? input.value : '';
-                    });
-                    renewalConfigData[provider.id] = entry;
-                });
-                const renewalResponse = await fetch('/api/renewal-config', {
-                    headers: { 'Content-Type': 'application/json' },
-                    method: 'POST',
-                    body: JSON.stringify(renewalConfigData)
-                });
-                if (!renewalResponse.ok) {
-                    throw new Error('自动续期凭据保存失败');
-                }
 
                 showAlert('success', '设置保存成功');
                 
@@ -6598,6 +7022,54 @@ const getHTMLContent = (title) => `
                     });
                 }
                 
+                // 支持 API 续期的服务商清单（后端 /api/renewal-providers 下发，新增适配器后自动出现）
+                let renewalProvidersData = [];
+
+                // 加载续期服务商清单，并填充“添加分类”表单的服务商下拉
+                async function loadRenewalProviders() {
+                    try {
+                        const response = await fetch('/api/renewal-providers');
+                        if (!response.ok) return;
+                        renewalProvidersData = await response.json();
+                        const select = document.getElementById('categoryRenewalProvider');
+                        if (select) {
+                            const current = select.value;
+                            select.innerHTML = '<option value="">不启用自动续期</option>' + renewalProvidersData.map(p => '<option value="' + escapeHtml(p.id) + '">' + escapeHtml(p.label) + '</option>').join('');
+                            select.value = current;
+                            renderCategoryRenewalFields('categoryRenewalFields', select.value, {});
+                        }
+                    } catch (error) {
+                        // 忽略加载失败（不影响分类管理本身）
+                    }
+                }
+
+                // 按所选服务商渲染凭据输入框（values 为已有值，可空）
+                function renderCategoryRenewalFields(containerId, providerId, values) {
+                    const container = document.getElementById(containerId);
+                    if (!container) return;
+                    const provider = renewalProvidersData.find(p => p.id === providerId);
+                    if (!provider) {
+                        container.innerHTML = '';
+                        return;
+                    }
+                    container.innerHTML = (provider.credentialFields || []).map(field =>
+                        '<div class="mb-3">' +
+                            '<label class="form-label"><i class="iconfont icon-key"></i> ' + escapeHtml(provider.label) + ' ' + escapeHtml(field.label || field.name) + '</label>' +
+                            '<input type="text" class="form-control" data-renewal-field="' + escapeHtml(field.name) + '" value="' + escapeHtml((values || {})[field.name] || '') + '" placeholder="' + escapeHtml(field.help || '') + '">' +
+                        '</div>'
+                    ).join('');
+                }
+
+                // 从某个凭据输入区收集续期配置（没选服务商返回 null）
+                function collectCategoryRenewal(containerId, providerId) {
+                    if (!providerId) return null;
+                    const credentials = {};
+                    document.querySelectorAll('#' + containerId + ' [data-renewal-field]').forEach(input => {
+                        credentials[input.dataset.renewalField] = input.value;
+                    });
+                    return { provider: providerId, credentials };
+                }
+
                 // 添加分类
                 async function addCategory() {
                     const nameInput = document.getElementById('categoryName');
@@ -6609,27 +7081,32 @@ const getHTMLContent = (title) => `
                     
                     const name = nameInput.value.trim();
                     const description = descInput.value.trim();
-                    
+
                     if (!name) {
                         showAlert('danger', '分类名称不能为空');
                         return;
                     }
-                    
+
+                    const renewalProviderSelect = document.getElementById('categoryRenewalProvider');
+                    const renewal = collectCategoryRenewal('categoryRenewalFields', renewalProviderSelect ? renewalProviderSelect.value : '');
+
                     try {
                         const response = await fetch('/api/categories', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ name, description })
+                            body: JSON.stringify({ name, description, renewal })
                         });
-                        
+
                         if (!response.ok) {
                             const error = await response.json();
                             throw new Error(error.error || '添加分类失败');
                         }
-                        
+
                         // 清空输入框
                         if (nameInput) nameInput.value = '';
                         if (descInput) descInput.value = '';
+                        if (renewalProviderSelect) renewalProviderSelect.value = '';
+                        renderCategoryRenewalFields('categoryRenewalFields', '', {});
                         
                         // 重新加载分类列表和域名列表
                         await loadCategories();
@@ -6672,6 +7149,14 @@ const getHTMLContent = (title) => `
                                 '<label class="form-label text-heading small">描述</label>' +
                                 '<input type="text" class="form-control form-control-sm" id="editDesc_' + escapeHtml(categoryId) + '" value="' + escapeHtml(category.description || '') + '" maxlength="100">' +
                             '</div>' +
+                            '<div class="mb-3">' +
+                                '<label class="form-label text-heading small">自动续期服务商</label>' +
+                                '<select class="form-select form-control-sm" id="editRenewalProvider_' + escapeHtml(categoryId) + '">' +
+                                    '<option value="">不启用自动续期</option>' +
+                                    renewalProvidersData.map(p => '<option value="' + escapeHtml(p.id) + '"' + (category.renewal && category.renewal.provider === p.id ? ' selected' : '') + '>' + escapeHtml(p.label) + '</option>').join('') +
+                                '</select>' +
+                            '</div>' +
+                            '<div id="editRenewalFields_' + escapeHtml(categoryId) + '"></div>' +
                             '<div class="d-flex gap-2">' +
                                 '<button type="button" class="btn btn-success btn-sm save-edit" data-id="' + escapeHtml(categoryId) + '">' +
                                     '<i class="iconfont icon-check" style="color: white;"></i> <span style="color: white;">保存</span>' +
@@ -6682,21 +7167,31 @@ const getHTMLContent = (title) => `
                             '</div>' +
                         '</div>';
                     
+                    // 渲染该分类已有的续期凭据输入框，并绑定服务商切换
+                    renderCategoryRenewalFields('editRenewalFields_' + categoryId, category.renewal ? category.renewal.provider : '', category.renewal ? category.renewal.credentials : {});
+                    const editRenewalProviderSelect = document.getElementById('editRenewalProvider_' + categoryId);
+                    if (editRenewalProviderSelect) {
+                        editRenewalProviderSelect.addEventListener('change', function() {
+                            renderCategoryRenewalFields('editRenewalFields_' + categoryId, this.value, {});
+                        });
+                    }
+
                     // 添加保存按钮事件
                     targetItem.querySelector('.save-edit').addEventListener('click', function() {
                         const nameInput = document.getElementById('editName_' + categoryId);
                         const descInput = document.getElementById('editDesc_' + categoryId);
-                        
+
                         const newName = nameInput.value.trim();
                         const newDesc = descInput.value.trim();
-                        
+
                         if (!newName) {
                             showAlert('danger', '分类名称不能为空');
                             nameInput.focus();
                             return;
                         }
-                        
-                        updateCategory(categoryId, newName, newDesc);
+
+                        const renewal = collectCategoryRenewal('editRenewalFields_' + categoryId, editRenewalProviderSelect ? editRenewalProviderSelect.value : '');
+                        updateCategory(categoryId, newName, newDesc, renewal);
                     });
                     
                     // 添加取消按钮事件
@@ -6710,12 +7205,12 @@ const getHTMLContent = (title) => `
                 }
                 
                 // 更新分类
-                async function updateCategory(categoryId, name, description) {
+                async function updateCategory(categoryId, name, description, renewal) {
                     try {
                         const response = await fetch('/api/categories/' + categoryId, {
                             method: 'PUT',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ name, description })
+                            body: JSON.stringify({ name, description, renewal })
                         });
                         
                         if (!response.ok) {
@@ -7411,28 +7906,7 @@ async function handleApiRequest(request) {
     }
   }
 
-  // 获取自动续期凭据配置
-  if (path === '/api/renewal-config' && request.method === 'GET') {
-    try {
-      const config = await getRenewalConfig();
-      return jsonResponse(config);
-    } catch (error) {
-      return jsonResponse({ error: '获取自动续期凭据配置失败' }, 500);
-    }
-  }
-
-  // 保存自动续期凭据配置
-  if (path === '/api/renewal-config' && request.method === 'POST') {
-    try {
-      const configData = await request.json();
-      const config = await saveRenewalConfig(configData);
-      return jsonResponse(config);
-    } catch (error) {
-      return jsonResponse({ error: '保存自动续期凭据配置失败: ' + error.message }, 400);
-    }
-  }
-
-  // 获取已注册的自动续期服务商及其凭据字段定义（供设置页动态渲染：新增适配器后设置页自动出现该家，不用改页面）
+  // 获取已注册的自动续期服务商及其凭据字段定义（供分类管理动态渲染：新增适配器后自动出现，不用改页面）
   if (path === '/api/renewal-providers' && request.method === 'GET') {
     try {
       const providers = RENEWAL_PROVIDERS.map(p => ({
@@ -8172,6 +8646,7 @@ async function addCategory(categoryData) {
     id,
     name: name.trim(),
     description: description?.trim() || '',
+    renewal: sanitizeCategoryRenewal(categoryData.renewal),
     order: maxOrder + 1,
     isDefault: false,
     createdAt: new Date().toISOString()
@@ -8208,11 +8683,12 @@ async function updateCategory(id, categoryData) {
     throw new Error('分类名称已存在');
   }
   
-  // 更新分类信息
+  // 更新分类信息（renewal 未提交时保留原值，提交了就按清洗结果整体替换）
   categories[categoryIndex] = {
     ...categories[categoryIndex],
     name: name.trim(),
     description: description?.trim() || '',
+    renewal: categoryData.renewal !== undefined ? sanitizeCategoryRenewal(categoryData.renewal) : categories[categoryIndex].renewal,
     updatedAt: new Date().toISOString()
   };
   
@@ -8351,9 +8827,10 @@ async function checkExpiringDomains() {
   const telegramConfig = await getTelegramConfigWithToken();
   const globalNotifyDays = telegramConfig.enabled ? telegramConfig.notifyDays : 30;
 
-  // API 自动续期：先把进入各服务商续期窗口的域名续掉，
+  // API 自动续期：先按分类配置把进入续期窗口的域名续掉，
   // 后面的到期提醒逻辑会用续期后的新到期日期判断，避免刚续完又发临期提醒
-  await autoRenewDomains(domains, telegramConfig);
+  const renewalCategories = await getCategories();
+  await autoRenewDomains(domains, renewalCategories, telegramConfig);
   
   // 判断域名是否符合过期提醒条件的辅助函数
   function needsExpiryNotify(domain) {
@@ -8467,9 +8944,9 @@ async function checkExpiringDomains() {
 // 架构：每个支持 API 续期的注册商是一个“适配器”，统一注册在 RENEWAL_PROVIDERS 里。
 // 通用流程只做四件事：拉该商账号清单 → 与面板域名匹配 → 窗口内调续期 → 同步到期日并 TG 播报。
 // 新增一家时照 DNSHE 适配器的形状再写一个对象（credentials / listDomains / renewDomain）即可，不用动通用流程。
-// 凭据约定：凭据存在 KV 的 renewal_config 里（在面板「设置 → 自动续期凭据」中填写），按服务商各存一份：
-// { <服务商id>: { <字段>: <值> } }；每家把自己需要的字段名登记在适配器的 credentialFields 里，
-// 通用层照单组装，任一字段缺失该商整体跳过。备份 KV 即包含全部续期配置，不依赖 Worker 环境变量。
+// 凭据约定：凭据挂在分类上（分类管理里填写），随分类一起存 KV 的 categories：
+// 分类对象多一个 renewal 字段 { provider: <服务商id>, credentials: { <字段>: <值> } }。
+// 续期范围就是该分类下的域名；没配 renewal 的分类不参与。备份 KV 即包含全部续期配置。
 // 开关逻辑：某域名在面板里单独关了到期提醒（notifySettings.enabled=false）的，不自动续（尊重单域名设置）；
 // 全局层面由各商自己的凭据决定——没配凭据的商整体跳过。
 // 安全线：已过期的域名一律不自动续（多家都有付费赎回/宽限规则，留给原有到期提醒人工处理）。
@@ -8497,37 +8974,9 @@ async function renewalApiRequest(url, { method = 'GET', headers = {}, body = nul
   return data;
 }
 
-// 读取 KV 中的续期凭据配置：{ <服务商id>: { <字段>: <值> } }，解析失败按空配置处理
-async function getRenewalConfig() {
-  try {
-    return JSON.parse(await DOMAIN_MONITOR.get('renewal_config') || '{}');
-  } catch (e) {
-    return {};
-  }
-}
-
-// 保存续期凭据配置（供设置接口调用）：只保留 { 服务商id: { 字段: 字符串 } } 形状，空字符串表示清除该字段
-async function saveRenewalConfig(configData) {
-  if (!configData || typeof configData !== 'object' || Array.isArray(configData)) {
-    throw new Error('凭据配置格式不正确');
-  }
-  const config = {};
-  for (const [providerId, fields] of Object.entries(configData)) {
-    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
-    config[providerId] = {};
-    for (const [field, value] of Object.entries(fields)) {
-      if (typeof value === 'string') {
-        config[providerId][field] = value;
-      }
-    }
-  }
-  await DOMAIN_MONITOR.put('renewal_config', JSON.stringify(config));
-  return config;
-}
-
-// 按适配器声明组装凭据：credentialFields 列出的字段都必须有非空值，否则返回 null（该商整体跳过）
-function buildProviderCredentials(provider, renewalConfig) {
-  const entry = (renewalConfig && renewalConfig[provider.id]) || {};
+// 按适配器声明组装凭据：credentialFields 列出的字段都必须有非空值，否则返回 null（该分类跳过）
+function buildProviderCredentials(provider, credentials) {
+  const entry = credentials || {};
   const creds = {};
   for (const field of provider.credentialFields || []) {
     const name = typeof field === 'string' ? field : field.name;
@@ -8537,8 +8986,22 @@ function buildProviderCredentials(provider, renewalConfig) {
   return creds;
 }
 
+// 清洗分类上的续期配置（分类对象的 renewal 字段）：服务商必须是已注册适配器，凭据只保留该商声明的字段
+function sanitizeCategoryRenewal(input) {
+  if (!input || typeof input !== 'object') return null;
+  const provider = RENEWAL_PROVIDERS.find(p => p.id === input.provider);
+  if (!provider) return null;
+  const rawCreds = (input.credentials && typeof input.credentials === 'object') ? input.credentials : {};
+  const credentials = {};
+  for (const field of provider.credentialFields || []) {
+    const name = typeof field === 'string' ? field : field.name;
+    credentials[name] = typeof rawCreds[name] === 'string' ? rawCreds[name] : '';
+  }
+  return { provider: provider.id, credentials };
+}
+
 // ---------- DNSHE 适配器 ----------
-// 凭据字段：apiKey / apiSecret（值在面板设置里填写，存 KV 的 renewal_config.dnshe；Key 在 DNSHE 控制台「API 管理」创建）
+// 凭据字段：apiKey / apiSecret（值挂在分类的 renewal.credentials 里，在分类管理中填写；Key 在 DNSHE 控制台「API 管理」创建）
 // 官方窗口：到期前 180 天可免费续；执行阈值取 175 天留余量
 const DNSHE_API_BASE = 'https://api005.dnshe.com/index.php?m=domain_hub';
 
@@ -8616,27 +9079,30 @@ const DNSHE_PROVIDER = {
 // 已接入的续期适配器清单（新增服务商往这里加）
 const RENEWAL_PROVIDERS = [DNSHE_PROVIDER];
 
-// 自动续期主流程（通用）：逐个适配器执行，规则对所有服务商一致
-async function autoRenewDomains(domains, telegramConfig) {
+// 自动续期主流程（通用）：逐个分类执行——凭据与续期范围都取自分类自己的 renewal 配置
+async function autoRenewDomains(domains, categories, telegramConfig) {
   const today = new Date();
-  const renewalConfig = await getRenewalConfig();
   const renewed = [];
   const failed = [];
   let domainsChanged = false;
+  const processed = new Set();
 
-  for (const provider of RENEWAL_PROVIDERS) {
-    const creds = buildProviderCredentials(provider, renewalConfig);
+  for (const category of categories || []) {
+    if (!category || !category.renewal || !category.renewal.provider) continue;
+    const provider = RENEWAL_PROVIDERS.find(p => p.id === category.renewal.provider);
+    if (!provider) continue;
+    const creds = buildProviderCredentials(provider, category.renewal.credentials);
     if (!creds) continue;
 
     let remoteList;
     try {
       remoteList = await provider.listDomains(creds);
     } catch (e) {
-      // 清单都拉不到（多半是凭据未配好）：该商静默跳过，避免每天报错刷屏
+      // 该分类的凭据拉不到清单（多半是没填对）：静默跳过，避免每天报错刷屏
       continue;
     }
 
-    // 失败去重状态：同一域名同一到期日的失败只通知一次，按服务商分别存 KV
+    // 失败去重状态：同一域名同一到期日的失败只通知一次，按服务商存 KV
     let renewState = {};
     try {
       renewState = JSON.parse(await DOMAIN_MONITOR.get(provider.stateKey) || '{}');
@@ -8647,6 +9113,7 @@ async function autoRenewDomains(domains, telegramConfig) {
 
     for (const remote of remoteList) {
       if (!remote || !remote.fullDomain) continue;
+      if (processed.has(remote.fullDomain)) continue;
       if (remote.neverExpires) continue;
       if (remote.status && remote.status !== 'active') continue;
       if (!remote.expiresAt) continue;
@@ -8654,15 +9121,18 @@ async function autoRenewDomains(domains, telegramConfig) {
       const daysLeft = Math.ceil((new Date(remote.expiresAt).getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
       if (daysLeft < 1 || daysLeft > provider.windowDays) continue;
 
-      // 与面板记录匹配（同名可能多条）
-      const matched = domains.filter(d => String(d.name || '').trim().toLowerCase().replace(/\.$/, '') === remote.fullDomain);
+      // 只处理属于本分类的域名（凭据挂在分类上，续期范围就是这个分类）
+      const matched = domains.filter(d => String(d.name || '').trim().toLowerCase().replace(/\.$/, '') === remote.fullDomain && d.categoryId === category.id);
+      if (matched.length === 0) continue;
       // 单域名开关：任一同名记录单独关了到期提醒，就尊重它、不自动续
       if (matched.some(d => d.notifySettings && d.notifySettings.enabled === false)) continue;
 
+      processed.add(remote.fullDomain);
       try {
         const result = await provider.renewDomain(creds, remote);
         renewed.push({
           providerLabel: provider.label,
+          categoryName: category.name,
           name: remote.fullDomain,
           oldExpiryDate: remote.expiresAt,
           newExpiryDate: result.newExpiresAt,
@@ -8684,6 +9154,7 @@ async function autoRenewDomains(domains, telegramConfig) {
         if (!alreadyNotified) {
           failed.push({
             providerLabel: provider.label,
+            categoryName: category.name,
             name: remote.fullDomain,
             expiryDate: remote.expiresAt,
             error: e.message,
@@ -8715,7 +9186,6 @@ async function autoRenewDomains(domains, telegramConfig) {
     }
   }
 }
-
 // 发送自动续期结果通知（多服务商合并一条，每条带服务商名）
 async function sendAutoRenewNotification(config, renewed, failed) {
   const title = '✅ <b>域名自动续期</b> ✅';
@@ -8729,6 +9199,9 @@ async function sendAutoRenewNotification(config, renewed, failed) {
     }
     message += '🌍 域名: ' + escapeHtmlBackend(item.name) + '\n';
     message += '🏬 服务商: ' + escapeHtmlBackend(item.providerLabel) + '\n';
+    if (item.categoryName) {
+      message += '📁 分类: ' + escapeHtmlBackend(item.categoryName) + '\n';
+    }
     message += '📅 原到期日期: ' + formatDate(item.oldExpiryDate) + '\n';
     if (item.newExpiryDate) {
       message += '📅 新到期日期: ' + formatDate(item.newExpiryDate) + '\n';
@@ -8749,6 +9222,9 @@ async function sendAutoRenewNotification(config, renewed, failed) {
       }
       message += '🌍 域名: ' + escapeHtmlBackend(item.name) + '\n';
       message += '🏬 服务商: ' + escapeHtmlBackend(item.providerLabel) + '\n';
+      if (item.categoryName) {
+        message += '📁 分类: ' + escapeHtmlBackend(item.categoryName) + '\n';
+      }
       message += '📅 到期日期: ' + formatDate(item.expiryDate) + '\n';
       message += '❌ 失败原因: ' + escapeHtmlBackend(item.error) + '\n';
     });
